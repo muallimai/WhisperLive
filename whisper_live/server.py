@@ -756,7 +756,7 @@ class ServeClientTensorRT(ServeClientBase):
 
 class ServeClientFasterWhisper(ServeClientBase):
 
-    MODEL_POOL = []
+    MODEL_POOL = {}
     MODEL_USER_COUNT = {}
     MODEL_POOL_LOCK = threading.Lock()
     MAX_USERS_PER_MODEL = 2
@@ -831,7 +831,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             # If no model is available and the pool isn't full, create a new one
             if len(ServeClientFasterWhisper.MODEL_POOL) < ServeClientFasterWhisper.MAX_MODELS:
                 self.create_model(device)
-                ServeClientFasterWhisper.MODEL_POOL.append(self.transcriber)
+                ServeClientFasterWhisper.MODEL_POOL[self.transcriber] = threading.Lock()
                 ServeClientFasterWhisper.MODEL_USER_COUNT[self.transcriber] = 1
                 logging.info(f"Created and assigned new model to client {self.client_uid}.")
             else:
@@ -919,8 +919,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             depends on the implementation of the `transcriber.transcribe` method but typically
             includes the transcribed text.
         """
-        if ServeClientFasterWhisper.SINGLE_MODEL:
-            ServeClientFasterWhisper.SINGLE_MODEL_LOCK.acquire()
+        ServeClientFasterWhisper.MODEL_POOL[self.transcriber].acquire()
         result, info = self.transcriber.transcribe(
             input_sample,
             initial_prompt=self.initial_prompt,
@@ -928,8 +927,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             task=self.task,
             vad_filter=self.use_vad,
             vad_parameters=self.vad_parameters if self.use_vad else None)
-        if ServeClientFasterWhisper.SINGLE_MODEL:
-            ServeClientFasterWhisper.SINGLE_MODEL_LOCK.release()
+        ServeClientFasterWhisper.MODEL_POOL[self.transcriber].release()
 
         if self.language is None and info is not None:
             self.set_language(info)

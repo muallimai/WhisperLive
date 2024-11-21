@@ -835,6 +835,7 @@ class ServeClientFasterWhisper(ServeClientBase):
         """
         Instantiates a new model, sets it as the transcriber.
         """
+        print("CREATE_MODEL")
         self.transcriber = WhisperModel(
             self.model_size_or_path,
             device=device,

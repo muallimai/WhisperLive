@@ -756,8 +756,11 @@ class ServeClientTensorRT(ServeClientBase):
 
 class ServeClientFasterWhisper(ServeClientBase):
 
-    SINGLE_MODEL = None
-    SINGLE_MODEL_LOCK = threading.Lock()
+    MODEL_POOL = []
+    MODEL_USER_COUNT = {}
+    MODEL_POOL_LOCK = threading.Lock()
+    MAX_USERS_PER_MODEL = 2
+    MAX_MODELS = 8
 
     def __init__(self, websocket, task="transcribe", device=None, language=None, client_uid=None, model="small.en",
                  initial_prompt=None, vad_parameters=None, use_vad=True, single_model=False):
@@ -807,14 +810,32 @@ class ServeClientFasterWhisper(ServeClientBase):
             return
         logging.info(f"Using Device={device} with precision {self.compute_type}")
 
-        if single_model:
-            if ServeClientFasterWhisper.SINGLE_MODEL is None:
+        # if single_model:
+        #     if ServeClientFasterWhisper.SINGLE_MODEL is None:
+        #         self.create_model(device)
+        #         ServeClientFasterWhisper.SINGLE_MODEL = self.transcriber
+        #     else:
+        #         self.transcriber = ServeClientFasterWhisper.SINGLE_MODEL
+        # else:
+        #     self.create_model(device)
+
+        with ServeClientFasterWhisper.MODEL_POOL_LOCK:
+            # Find a model with fewer than MAX_USERS_PER_MODEL
+            for model_instance, user_count in ServeClientFasterWhisper.MODEL_USER_COUNT.items():
+                if user_count < ServeClientFasterWhisper.MAX_USERS_PER_MODEL:
+                    ServeClientFasterWhisper.MODEL_USER_COUNT[model_instance] += 1
+                    self.transcriber = model_instance
+                    logging.info(f"Assigned existing model to client {self.client_uid}. Current user count: {user_count + 1}")
+                    return
+
+            # If no model is available and the pool isn't full, create a new one
+            if len(ServeClientFasterWhisper.MODEL_POOL) < ServeClientFasterWhisper.MAX_MODELS:
                 self.create_model(device)
-                ServeClientFasterWhisper.SINGLE_MODEL = self.transcriber
+                ServeClientFasterWhisper.MODEL_POOL.append(self.transcriber)
+                ServeClientFasterWhisper.MODEL_USER_COUNT[self.transcriber] = 1
+                logging.info(f"Created and assigned new model to client {self.client_uid}.")
             else:
-                self.transcriber = ServeClientFasterWhisper.SINGLE_MODEL
-        else:
-            self.create_model(device)
+                raise RuntimeError("All models are at capacity. Cannot assign a model to this client.")
 
         self.use_vad = use_vad
 

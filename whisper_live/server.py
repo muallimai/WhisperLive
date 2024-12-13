@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 class ClientManager:
-    def __init__(self, max_clients=4, max_connection_time=600):
+    def __init__(self, max_clients=40, max_connection_time=600):
         """
         Initializes the ClientManager with specified limits on client connections and connection durations.
 
@@ -98,6 +98,8 @@ class ClientManager:
         if len(self.clients) >= self.max_clients:
             wait_time = self.get_wait_time()
             response = {"uid": options["uid"], "status": "WAIT", "message": wait_time}
+            logging.info("---- WAIT SENT")
+            logging.info(str(response))
             websocket.send(json.dumps(response))
             return True
         return False
@@ -167,9 +169,10 @@ class TranscriptionServer:
 
     def handle_new_connection(self, websocket, faster_whisper_custom_model_path):
         try:
-            logging.info("New client connected")
+            logging.info("New client connected, awaiting options")
             options = websocket.recv()
             options = json.loads(options)
+            logging.info("Options received: " + str(options))
 
             if self.client_manager is None:
                 max_clients = options.get('max_clients', 4)

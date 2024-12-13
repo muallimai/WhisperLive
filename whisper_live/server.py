@@ -175,7 +175,7 @@ class TranscriptionServer:
             logging.info("Options received: " + str(options))
 
             if self.client_manager is None:
-                max_clients = options.get('max_clients', 4)
+                max_clients = 100 # TODO
                 max_connection_time = options.get('max_connection_time', 600)
                 self.client_manager = ClientManager(max_clients, max_connection_time)
 

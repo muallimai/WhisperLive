@@ -490,7 +490,7 @@ class ServeClientBase(object):
         self.exit = True
 
 class ServeClientFasterWhisper(ServeClientBase):
-    MAX_MODELS = 8
+    MAX_MODELS = 4
     MODELS_TO_LOCKS = []
     CURRENT_MODEL_INDEX = 0
 

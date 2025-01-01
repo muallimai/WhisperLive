@@ -13,6 +13,7 @@ from websockets.sync.server import serve
 from websockets.exceptions import ConnectionClosed
 from whisper_live.vad import VoiceActivityDetector
 from whisper_live.transcriber import WhisperModel
+from whisper_live.transcription_manager import TranscriptionManager
 
 logging.basicConfig(level=logging.INFO)
 
@@ -104,23 +105,6 @@ class ClientManager:
             return True
         return False
 
-    def is_client_timeout(self, websocket):
-        """
-        Checks if a client has exceeded the maximum allowed connection time and disconnects them if so, issuing a warning.
-
-        Args:
-            websocket: The websocket associated with the client to check.
-
-        Returns:
-            True if the client's connection time has exceeded the maximum limit, False otherwise.
-        """
-        elapsed_time = time.time() - self.start_times[websocket]
-        if elapsed_time >= self.max_connection_time:
-            self.clients[websocket].disconnect()
-            logging.warning(f"Client with uid '{self.clients[websocket].client_uid}' disconnected due to overtime.")
-            return True
-        return False
-
 class TranscriptionServer:
     RATE = 16000
 
@@ -148,6 +132,7 @@ class TranscriptionServer:
             )
 
         except Exception as e:
+            logging.error(e)
             return
 
         self.client_manager.add_client(websocket, client)
@@ -234,7 +219,7 @@ class TranscriptionServer:
             return
 
         try:
-            while not self.client_manager.is_client_timeout(websocket):
+            while True:
                 if not self.process_audio_frames(websocket):
                     break
         except ConnectionClosed:
@@ -317,6 +302,8 @@ class ServeClientBase(object):
     SERVER_READY = "SERVER_READY"
     DISCONNECT = "DISCONNECT"
 
+    transcription_manager = TranscriptionManager()
+
     def __init__(self, client_uid, websocket):
         self.client_uid = client_uid
         self.websocket = websocket
@@ -338,7 +325,6 @@ class ServeClientBase(object):
         # text formatting
         self.pick_previous_segments = 2
 
-        # threading
         self.lock = threading.Lock()
 
     def speech_to_text(self):
@@ -380,6 +366,7 @@ class ServeClientBase(object):
         else:
             self.frames_np = np.concatenate((self.frames_np, frame_np), axis=0)
         self.lock.release()
+
 
     def clip_audio_if_no_valid_segment(self):
         """
@@ -493,10 +480,6 @@ class ServeClientBase(object):
         self.exit = True
 
 class ServeClientFasterWhisper(ServeClientBase):
-    MAX_MODELS = 8
-    MODELS_TO_LOCKS = []
-    CURRENT_MODEL_INDEX = 0
-
     def __init__(self, websocket, task="transcribe", device=None, language=None, client_uid=None, model="small.en",
                  initial_prompt=None, vad_parameters=None, use_vad=True):
         """
@@ -529,41 +512,6 @@ class ServeClientFasterWhisper(ServeClientBase):
         self.vad_parameters = vad_parameters or {"onset": 0.5}
         self.no_speech_thresh = 0.45
         self.same_output_threshold = 10
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if device == "cuda":
-            major, _ = torch.cuda.get_device_capability(device)
-            self.compute_type = "float16" if major >= 7 else "float32"
-        else:
-            self.compute_type = "int8"
-
-        if self.model_size_or_path is None:
-            return
-        logging.info(f"Using Device={device} with precision {self.compute_type}")
-    
-        try:
-            if len(ServeClientFasterWhisper.MODELS_TO_LOCKS) < ServeClientFasterWhisper.MAX_MODELS:
-                self.create_model(device)
-                ServeClientFasterWhisper.MODELS_TO_LOCKS.append((self.transcriber, self.lock))
-                logging.info("Created new model at " + str(ServeClientFasterWhisper.CURRENT_MODEL_INDEX))
-            else:
-                logging.info("Using exisitng model " + str(ServeClientFasterWhisper.CURRENT_MODEL_INDEX))
-                self.transcriber, self.lock = ServeClientFasterWhisper.MODELS_TO_LOCKS[ServeClientFasterWhisper.CURRENT_MODEL_INDEX]
-
-            ServeClientFasterWhisper.CURRENT_MODEL_INDEX += 1
-            if ServeClientFasterWhisper.CURRENT_MODEL_INDEX == ServeClientFasterWhisper.MAX_MODELS:
-                ServeClientFasterWhisper.CURRENT_MODEL_INDEX = 0
-
-        except Exception as e:
-            logging.error(f"Failed to load model: {e}", exc_info=True)
-            self.websocket.send(json.dumps({
-                "uid": self.client_uid,
-                "status": "ERROR",
-                "message": f"Failed to load model: {str(self.model_size_or_path)}"
-            }))
-            self.websocket.close()
-            return
-
         self.use_vad = use_vad
 
         # threading
@@ -577,18 +525,6 @@ class ServeClientFasterWhisper(ServeClientBase):
                 }
             )
         )
-
-    def create_model(self, device):
-        """
-        Instantiates a new model, sets it as the transcriber.
-        """
-        self.transcriber = WhisperModel(
-            self.model_size_or_path,
-            device=device,
-            compute_type=self.compute_type,
-            local_files_only=False,
-        )
-        self.lock = threading.Lock()
 
     def check_valid_model(self, model_size):
         """
@@ -645,8 +581,9 @@ class ServeClientFasterWhisper(ServeClientBase):
             depends on the implementation of the `transcriber.transcribe` method but typically
             includes the transcribed text.
         """
+        transcriber = ServeClientFasterWhisper.transcription_manager.get_available_model()
         self.lock.acquire()
-        result, info = self.transcriber.transcribe(
+        result, info = transcriber.transcribe(
             input_sample,
             initial_prompt=self.initial_prompt,
             language=self.language,
@@ -654,6 +591,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             vad_filter=self.use_vad,
             vad_parameters=self.vad_parameters if self.use_vad else None)
         self.lock.release()
+        ServeClientFasterWhisper.transcription_manager.release_model(transcriber)
 
         if self.language is None and info is not None:
             self.set_language(info)

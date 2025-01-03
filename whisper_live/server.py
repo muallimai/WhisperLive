@@ -734,8 +734,8 @@ class ServeClientFasterWhisper(ServeClientBase):
             self.clip_audio_if_no_valid_segment()
 
             input_bytes, duration = self.get_audio_chunk_for_processing()
-            if duration < 10.0:
-                time.sleep(1)     # wait for audio chunks to arrive
+            if duration < 1.0:
+                time.sleep(0.1)     # wait for audio chunks to arrive
                 continue
             try:
                 input_sample = input_bytes.copy()

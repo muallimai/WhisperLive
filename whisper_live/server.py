@@ -826,22 +826,23 @@ class ServeClientFasterWhisper(ServeClientBase):
                     ServeClientFasterWhisper.MODEL_USER_COUNT[model_instance] += 1
                     self.transcriber = model_instance
                     logging.info(f"Assigned existing model to client {self.client_uid}. Current user count: {user_count + 1}")
-                    return
 
             # If no model is available and the pool isn't full, create a new one
-            if len(ServeClientFasterWhisper.MODEL_POOL) < ServeClientFasterWhisper.MAX_MODELS:
-                self.create_model(device)
-                ServeClientFasterWhisper.MODEL_POOL[self.transcriber] = threading.Lock()
-                ServeClientFasterWhisper.MODEL_USER_COUNT[self.transcriber] = 1
-                logging.info(f"Created and assigned new model to client {self.client_uid}.")
-            else:
-                raise RuntimeError("All models are at capacity. Cannot assign a model to this client.")
+            if not hasattr(self, 'transcriber'):
+                if len(ServeClientFasterWhisper.MODEL_POOL) < ServeClientFasterWhisper.MAX_MODELS:
+                    self.create_model(device)
+                    ServeClientFasterWhisper.MODEL_POOL[self.transcriber] = threading.Lock()
+                    ServeClientFasterWhisper.MODEL_USER_COUNT[self.transcriber] = 1
+                    logging.info(f"Created and assigned new model to client {self.client_uid}.")
+                else:
+                    raise RuntimeError("All models are at capacity. Cannot assign a model to this client.")
 
         self.use_vad = use_vad
 
         # threading
         self.trans_thread = threading.Thread(target=self.speech_to_text)
         self.trans_thread.start()
+        print('sending ready')
         self.websocket.send(
             json.dumps(
                 {

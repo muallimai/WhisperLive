@@ -493,9 +493,11 @@ class ServeClientBase(object):
         self.exit = True
 
 class ServeClientFasterWhisper(ServeClientBase):
-    MAX_MODELS = 16
-    MODELS_TO_LOCKS = []
-    CURRENT_MODEL_INDEX = 0
+    MODEL_POOL = {}
+    MODEL_USER_COUNT = {}
+    MODEL_POOL_LOCK = threading.Lock()
+    MAX_USERS_PER_MODEL = 2
+    MAX_MODELS = 8
 
     def __init__(self, websocket, task="transcribe", device=None, language=None, client_uid=None, model="small.en",
                  initial_prompt=None, vad_parameters=None, use_vad=True):
@@ -540,35 +542,40 @@ class ServeClientFasterWhisper(ServeClientBase):
         if self.model_size_or_path is None:
             return
         logging.info(f"Using Device={device} with precision {self.compute_type}")
-    
-        try:
-            if len(ServeClientFasterWhisper.MODELS_TO_LOCKS) < ServeClientFasterWhisper.MAX_MODELS:
-                self.create_model(device)
-                ServeClientFasterWhisper.MODELS_TO_LOCKS.append((self.transcriber, self.lock))
-                logging.info("Created new model at " + str(ServeClientFasterWhisper.CURRENT_MODEL_INDEX))
-            else:
-                logging.info("Using exisitng model " + str(ServeClientFasterWhisper.CURRENT_MODEL_INDEX))
-                self.transcriber, self.lock = ServeClientFasterWhisper.MODELS_TO_LOCKS[ServeClientFasterWhisper.CURRENT_MODEL_INDEX]
 
-            ServeClientFasterWhisper.CURRENT_MODEL_INDEX += 1
-            if ServeClientFasterWhisper.CURRENT_MODEL_INDEX == ServeClientFasterWhisper.MAX_MODELS:
-                ServeClientFasterWhisper.CURRENT_MODEL_INDEX = 0
+        # if single_model:
+        #     if ServeClientFasterWhisper.SINGLE_MODEL is None:
+        #         self.create_model(device)
+        #         ServeClientFasterWhisper.SINGLE_MODEL = self.transcriber
+        #     else:
+        #         self.transcriber = ServeClientFasterWhisper.SINGLE_MODEL
+        # else:
+        #     self.create_model(device)
 
-        except Exception as e:
-            logging.error(f"Failed to load model: {e}", exc_info=True)
-            self.websocket.send(json.dumps({
-                "uid": self.client_uid,
-                "status": "ERROR",
-                "message": f"Failed to load model: {str(self.model_size_or_path)}"
-            }))
-            self.websocket.close()
-            return
+        with ServeClientFasterWhisper.MODEL_POOL_LOCK:
+            # Find a model with fewer than MAX_USERS_PER_MODEL
+            for model_instance, user_count in ServeClientFasterWhisper.MODEL_USER_COUNT.items():
+                if user_count < ServeClientFasterWhisper.MAX_USERS_PER_MODEL:
+                    ServeClientFasterWhisper.MODEL_USER_COUNT[model_instance] += 1
+                    self.transcriber = model_instance
+                    logging.info(f"Assigned existing model to client {self.client_uid}. Current user count: {user_count + 1}")
+
+            # If no model is available and the pool isn't full, create a new one
+            if not hasattr(self, 'transcriber'):
+                if len(ServeClientFasterWhisper.MODEL_POOL) < ServeClientFasterWhisper.MAX_MODELS:
+                    self.create_model(device)
+                    ServeClientFasterWhisper.MODEL_POOL[self.transcriber] = threading.Lock()
+                    ServeClientFasterWhisper.MODEL_USER_COUNT[self.transcriber] = 1
+                    logging.info(f"Created and assigned new model to client {self.client_uid}.")
+                else:
+                    raise RuntimeError("All models are at capacity. Cannot assign a model to this client.")
 
         self.use_vad = use_vad
 
         # threading
         self.trans_thread = threading.Thread(target=self.speech_to_text)
         self.trans_thread.start()
+        print('sending ready')
         self.websocket.send(
             json.dumps(
                 {
@@ -582,6 +589,7 @@ class ServeClientFasterWhisper(ServeClientBase):
         """
         Instantiates a new model, sets it as the transcriber.
         """
+        print("CREATE_MODEL")
         self.transcriber = WhisperModel(
             self.model_size_or_path,
             device=device,
@@ -645,7 +653,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             depends on the implementation of the `transcriber.transcribe` method but typically
             includes the transcribed text.
         """
-        self.lock.acquire()
+        ServeClientFasterWhisper.MODEL_POOL[self.transcriber].acquire()
         result, info = self.transcriber.transcribe(
             input_sample,
             initial_prompt=self.initial_prompt,
@@ -653,7 +661,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             task=self.task,
             vad_filter=self.use_vad,
             vad_parameters=self.vad_parameters if self.use_vad else None)
-        self.lock.release()
+        ServeClientFasterWhisper.MODEL_POOL[self.transcriber].release()
 
         if self.language is None and info is not None:
             self.set_language(info)

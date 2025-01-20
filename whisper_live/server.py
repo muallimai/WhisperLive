@@ -13,16 +13,12 @@ from websockets.sync.server import serve
 from websockets.exceptions import ConnectionClosed
 from whisper_live.vad import VoiceActivityDetector
 from whisper_live.transcriber import WhisperModel
-try:
-    from whisper_live.transcriber_tensorrt import WhisperTRTLLM
-except Exception:
-    pass
 
 logging.basicConfig(level=logging.INFO)
 
 
 class ClientManager:
-    def __init__(self, max_clients=4, max_connection_time=600):
+    def __init__(self, max_clients=40, max_connection_time=600):
         """
         Initializes the ClientManager with specified limits on client connections and connection durations.
 
@@ -102,6 +98,8 @@ class ClientManager:
         if len(self.clients) >= self.max_clients:
             wait_time = self.get_wait_time()
             response = {"uid": options["uid"], "status": "WAIT", "message": wait_time}
+            logging.info("---- WAIT SENT")
+            logging.info(str(response))
             websocket.send(json.dumps(response))
             return True
         return False
@@ -123,26 +121,6 @@ class ClientManager:
             return True
         return False
 
-
-class BackendType(Enum):
-    FASTER_WHISPER = "faster_whisper"
-    TENSORRT = "tensorrt"
-
-    @staticmethod
-    def valid_types() -> List[str]:
-        return [backend_type.value for backend_type in BackendType]
-
-    @staticmethod
-    def is_valid(backend: str) -> bool:
-        return backend in BackendType.valid_types()
-
-    def is_faster_whisper(self) -> bool:
-        return self == BackendType.FASTER_WHISPER
-
-    def is_tensorrt(self) -> bool:
-        return self == BackendType.TENSORRT
-
-
 class TranscriptionServer:
     RATE = 16000
 
@@ -150,38 +128,11 @@ class TranscriptionServer:
         self.client_manager = None
         self.no_voice_activity_chunks = 0
         self.use_vad = True
-        self.single_model = False
 
     def initialize_client(
-        self, websocket, options, faster_whisper_custom_model_path,
-        whisper_tensorrt_path, trt_multilingual
-    ):
-        client: Optional[ServeClientBase] = None
+        self, websocket, options, faster_whisper_custom_model_path):
 
-        if self.backend.is_tensorrt():
-            try:
-                client = ServeClientTensorRT(
-                    websocket,
-                    multilingual=trt_multilingual,
-                    language=options["language"],
-                    task=options["task"],
-                    client_uid=options["uid"],
-                    model=whisper_tensorrt_path,
-                    single_model=self.single_model,
-                )
-                logging.info("Running TensorRT backend.")
-            except Exception as e:
-                logging.error(f"TensorRT-LLM not supported: {e}")
-                self.client_uid = options["uid"]
-                websocket.send(json.dumps({
-                    "uid": self.client_uid,
-                    "status": "WARNING",
-                    "message": "TensorRT-LLM not supported on Server yet. "
-                               "Reverting to available backend: 'faster_whisper'"
-                }))
-                self.backend = BackendType.FASTER_WHISPER
-
-        if self.backend.is_faster_whisper():
+        try:
             if faster_whisper_custom_model_path is not None and os.path.exists(faster_whisper_custom_model_path):
                 logging.info(f"Using custom model {faster_whisper_custom_model_path}")
                 options["model"] = faster_whisper_custom_model_path
@@ -194,12 +145,10 @@ class TranscriptionServer:
                 initial_prompt=options.get("initial_prompt"),
                 vad_parameters=options.get("vad_parameters"),
                 use_vad=self.use_vad,
-                single_model=self.single_model,
             )
-            logging.info("Running faster_whisper backend.")
 
-        if client is None:
-            raise ValueError(f"Backend type {self.backend.value} not recognised or not handled.")
+        except Exception as e:
+            return
 
         self.client_manager.add_client(websocket, client)
 
@@ -218,15 +167,15 @@ class TranscriptionServer:
             return False
         return np.frombuffer(frame_data, dtype=np.float32)
 
-    def handle_new_connection(self, websocket, faster_whisper_custom_model_path,
-                              whisper_tensorrt_path, trt_multilingual):
+    def handle_new_connection(self, websocket, faster_whisper_custom_model_path):
         try:
-            logging.info("New client connected")
+            logging.info("New client connected, awaiting options")
             options = websocket.recv()
             options = json.loads(options)
-            
+            logging.info("Options received: " + str(options))
+
             if self.client_manager is None:
-                max_clients = options.get('max_clients', 4)
+                max_clients = 100 # TODO
                 max_connection_time = options.get('max_connection_time', 600)
                 self.client_manager = ClientManager(max_clients, max_connection_time)
 
@@ -235,10 +184,7 @@ class TranscriptionServer:
                 websocket.close()
                 return False  # Indicates that the connection should not continue
 
-            if self.backend.is_tensorrt():
-                self.vad_detector = VoiceActivityDetector(frame_rate=self.RATE)
-            self.initialize_client(websocket, options, faster_whisper_custom_model_path,
-                                   whisper_tensorrt_path, trt_multilingual)
+            self.initialize_client(websocket, options, faster_whisper_custom_model_path)
             return True
         except json.JSONDecodeError:
             logging.error("Failed to decode JSON from client")
@@ -254,26 +200,14 @@ class TranscriptionServer:
         frame_np = self.get_audio_from_websocket(websocket)
         client = self.client_manager.get_client(websocket)
         if frame_np is False:
-            if self.backend.is_tensorrt():
-                client.set_eos(True)
             return False
-
-        if self.backend.is_tensorrt():
-            voice_active = self.voice_activity(websocket, frame_np)
-            if voice_active:
-                self.no_voice_activity_chunks = 0
-                client.set_eos(False)
-            if self.use_vad and not voice_active:
-                return True
 
         client.add_frames(frame_np)
         return True
 
     def recv_audio(self,
                    websocket,
-                   backend: BackendType = BackendType.FASTER_WHISPER,
                    faster_whisper_custom_model_path=None,
-                   whisper_tensorrt_path=None,
                    trt_multilingual=False):
         """
         Receive audio chunks from a client in an infinite loop.
@@ -291,17 +225,12 @@ class TranscriptionServer:
 
         Args:
             websocket (WebSocket): The WebSocket connection for the client.
-            backend (str): The backend to run the server with.
             faster_whisper_custom_model_path (str): path to custom faster whisper model.
-            whisper_tensorrt_path (str): Required for tensorrt backend.
-            trt_multilingual(bool): Only used for tensorrt, True if multilingual model.
 
         Raises:
             Exception: If there is an error during the audio frame processing.
         """
-        self.backend = backend
-        if not self.handle_new_connection(websocket, faster_whisper_custom_model_path,
-                                          whisper_tensorrt_path, trt_multilingual):
+        if not self.handle_new_connection(websocket, faster_whisper_custom_model_path):
             return
 
         try:
@@ -321,11 +250,7 @@ class TranscriptionServer:
     def run(self,
             host,
             port=9090,
-            backend="tensorrt",
-            faster_whisper_custom_model_path=None,
-            whisper_tensorrt_path=None,
-            trt_multilingual=False,
-            single_model=False):
+            faster_whisper_custom_model_path=None):
         """
         Run the transcription server.
 
@@ -335,24 +260,11 @@ class TranscriptionServer:
         """
         if faster_whisper_custom_model_path is not None and not os.path.exists(faster_whisper_custom_model_path):
             raise ValueError(f"Custom faster_whisper model '{faster_whisper_custom_model_path}' is not a valid path.")
-        if whisper_tensorrt_path is not None and not os.path.exists(whisper_tensorrt_path):
-            raise ValueError(f"TensorRT model '{whisper_tensorrt_path}' is not a valid path.")
-        if single_model:
-            if faster_whisper_custom_model_path or whisper_tensorrt_path:
-                logging.info("Custom model option was provided. Switching to single model mode.")
-                self.single_model = True
-                # TODO: load model initially
-            else:
-                logging.info("Single model mode currently only works with custom models.")
-        if not BackendType.is_valid(backend):
-            raise ValueError(f"{backend} is not a valid backend type. Choose backend from {BackendType.valid_types()}")
+
         with serve(
             functools.partial(
                 self.recv_audio,
-                backend=BackendType(backend),
                 faster_whisper_custom_model_path=faster_whisper_custom_model_path,
-                whisper_tensorrt_path=whisper_tensorrt_path,
-                trt_multilingual=trt_multilingual
             ),
             host,
             port
@@ -580,182 +492,7 @@ class ServeClientBase(object):
         logging.info("Cleaning up.")
         self.exit = True
 
-
-class ServeClientTensorRT(ServeClientBase):
-
-    SINGLE_MODEL = None
-    SINGLE_MODEL_LOCK = threading.Lock()
-
-    def __init__(self, websocket, task="transcribe", multilingual=False, language=None, client_uid=None, model=None, single_model=False):
-        """
-        Initialize a ServeClient instance.
-        The Whisper model is initialized based on the client's language and device availability.
-        The transcription thread is started upon initialization. A "SERVER_READY" message is sent
-        to the client to indicate that the server is ready.
-
-        Args:
-            websocket (WebSocket): The WebSocket connection for the client.
-            task (str, optional): The task type, e.g., "transcribe." Defaults to "transcribe".
-            device (str, optional): The device type for Whisper, "cuda" or "cpu". Defaults to None.
-            multilingual (bool, optional): Whether the client supports multilingual transcription. Defaults to False.
-            language (str, optional): The language for transcription. Defaults to None.
-            client_uid (str, optional): A unique identifier for the client. Defaults to None.
-            single_model (bool, optional): Whether to instantiate a new model for each client connection. Defaults to False.
-
-        """
-        super().__init__(client_uid, websocket)
-        self.language = language if multilingual else "en"
-        self.task = task
-        self.eos = False
-
-        if single_model:
-            if ServeClientTensorRT.SINGLE_MODEL is None:
-                self.create_model(model, multilingual)
-                ServeClientTensorRT.SINGLE_MODEL = self.transcriber
-            else:
-                self.transcriber = ServeClientTensorRT.SINGLE_MODEL
-        else:
-            self.create_model(model, multilingual)
-
-        # threading
-        self.trans_thread = threading.Thread(target=self.speech_to_text)
-        self.trans_thread.start()
-
-        self.websocket.send(json.dumps({
-            "uid": self.client_uid,
-            "message": self.SERVER_READY,
-            "backend": "tensorrt"
-        }))
-
-    def create_model(self, model, multilingual, warmup=True):
-        """
-        Instantiates a new model, sets it as the transcriber and does warmup if desired.
-        """
-        self.transcriber = WhisperTRTLLM(
-            model,
-            assets_dir="assets",
-            device="cuda",
-            is_multilingual=multilingual,
-            language=self.language,
-            task=self.task
-        )
-        if warmup:
-            self.warmup()
-
-    def warmup(self, warmup_steps=10):
-        """
-        Warmup TensorRT since first few inferences are slow.
-
-        Args:
-            warmup_steps (int): Number of steps to warm up the model for.
-        """
-        logging.info("[INFO:] Warming up TensorRT engine..")
-        mel, _ = self.transcriber.log_mel_spectrogram("assets/jfk.flac")
-        for i in range(warmup_steps):
-            self.transcriber.transcribe(mel)
-
-    def set_eos(self, eos):
-        """
-        Sets the End of Speech (EOS) flag.
-
-        Args:
-            eos (bool): The value to set for the EOS flag.
-        """
-        self.lock.acquire()
-        self.eos = eos
-        self.lock.release()
-
-    def handle_transcription_output(self, last_segment, duration):
-        """
-        Handle the transcription output, updating the transcript and sending data to the client.
-
-        Args:
-            last_segment (str): The last segment from the whisper output which is considered to be incomplete because
-                                of the possibility of word being truncated.
-            duration (float): Duration of the transcribed audio chunk.
-        """
-        segments = self.prepare_segments({"text": last_segment})
-        self.send_transcription_to_client(segments)
-        if self.eos:
-            self.update_timestamp_offset(last_segment, duration)
-
-    def transcribe_audio(self, input_bytes):
-        """
-        Transcribe the audio chunk and send the results to the client.
-
-        Args:
-            input_bytes (np.array): The audio chunk to transcribe.
-        """
-        if ServeClientTensorRT.SINGLE_MODEL:
-            ServeClientTensorRT.SINGLE_MODEL_LOCK.acquire()
-        logging.info(f"[WhisperTensorRT:] Processing audio with duration: {input_bytes.shape[0] / self.RATE}")
-        mel, duration = self.transcriber.log_mel_spectrogram(input_bytes)
-        last_segment = self.transcriber.transcribe(
-            mel,
-            text_prefix=f"<|startoftranscript|><|{self.language}|><|{self.task}|><|notimestamps|>"
-        )
-        if ServeClientTensorRT.SINGLE_MODEL:
-            ServeClientTensorRT.SINGLE_MODEL_LOCK.release()
-        if last_segment:
-            self.handle_transcription_output(last_segment, duration)
-
-    def update_timestamp_offset(self, last_segment, duration):
-        """
-        Update timestamp offset and transcript.
-
-        Args:
-            last_segment (str): Last transcribed audio from the whisper model.
-            duration (float): Duration of the last audio chunk.
-        """
-        if not len(self.transcript):
-            self.transcript.append({"text": last_segment + " "})
-        elif self.transcript[-1]["text"].strip() != last_segment:
-            self.transcript.append({"text": last_segment + " "})
-        self.timestamp_offset += duration
-
-    def speech_to_text(self):
-        """
-        Process an audio stream in an infinite loop, continuously transcribing the speech.
-
-        This method continuously receives audio frames, performs real-time transcription, and sends
-        transcribed segments to the client via a WebSocket connection.
-
-        If the client's language is not detected, it waits for 30 seconds of audio input to make a language prediction.
-        It utilizes the Whisper ASR model to transcribe the audio, continuously processing and streaming results. Segments
-        are sent to the client in real-time, and a history of segments is maintained to provide context.Pauses in speech
-        (no output from Whisper) are handled by showing the previous output for a set duration. A blank segment is added if
-        there is no speech for a specified duration to indicate a pause.
-
-        Raises:
-            Exception: If there is an issue with audio processing or WebSocket communication.
-
-        """
-        while True:
-            if self.exit:
-                logging.info("Exiting speech to text thread")
-                break
-
-            if self.frames_np is None:
-                time.sleep(0.02)    # wait for any audio to arrive
-                continue
-
-            self.clip_audio_if_no_valid_segment()
-
-            input_bytes, duration = self.get_audio_chunk_for_processing()
-            if duration < 0.4:
-                continue
-
-            try:
-                input_sample = input_bytes.copy()
-                logging.info(f"[WhisperTensorRT:] Processing audio with duration: {duration}")
-                self.transcribe_audio(input_sample)
-
-            except Exception as e:
-                logging.error(f"[ERROR]: {e}")
-
-
 class ServeClientFasterWhisper(ServeClientBase):
-
     MODEL_POOL = {}
     MODEL_USER_COUNT = {}
     MODEL_POOL_LOCK = threading.Lock()
@@ -763,7 +500,7 @@ class ServeClientFasterWhisper(ServeClientBase):
     MAX_MODELS = 8
 
     def __init__(self, websocket, task="transcribe", device=None, language=None, client_uid=None, model="small.en",
-                 initial_prompt=None, vad_parameters=None, use_vad=True, single_model=False):
+                 initial_prompt=None, vad_parameters=None, use_vad=True):
         """
         Initialize a ServeClient instance.
         The Whisper model is initialized based on the client's language and device availability.
@@ -778,7 +515,6 @@ class ServeClientFasterWhisper(ServeClientBase):
             client_uid (str, optional): A unique identifier for the client. Defaults to None.
             model (str, optional): The whisper model size. Defaults to 'small.en'
             initial_prompt (str, optional): Prompt for whisper inference. Defaults to None.
-            single_model (bool, optional): Whether to instantiate a new model for each client connection. Defaults to False.
         """
         super().__init__(client_uid, websocket)
         self.model_sizes = [
@@ -788,10 +524,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             "large-v3-turbo", "turbo"
         ]
 
-        if not os.path.exists(model):
-            self.model_size_or_path = self.check_valid_model(model)
-        else:
-            self.model_size_or_path = model
+        self.model_size_or_path = model
         self.language = "en" if self.model_size_or_path.endswith("en") else language
         self.task = task
         self.initial_prompt = initial_prompt
@@ -847,8 +580,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             json.dumps(
                 {
                     "uid": self.client_uid,
-                    "message": self.SERVER_READY,
-                    "backend": "faster_whisper"
+                    "message": self.SERVER_READY
                 }
             )
         )
@@ -864,6 +596,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             compute_type=self.compute_type,
             local_files_only=False,
         )
+        self.lock = threading.Lock()
 
     def check_valid_model(self, model_size):
         """
